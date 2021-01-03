@@ -20,7 +20,7 @@ export PATH=$PATH:/usr/local/bin/:/usr/bin
 #
 
 usage() {
-    echo -e "\nUsage: $0 [-d <days>] [-r <remote_instances>] [-f <gcloud_filter_expression>] [-p <prefix>] [-a <service_account>] [-n <dry_run>] [-j <project_id>]" 1>&2
+    echo -e "\nUsage: $0 [-d <days>] [-r <remote_instances>] [-f <gcloud_filter_expression>] [-p <prefix>] [-a <service_account>] [-n <dry_run>] [-j <project_id>] [-i <bucket_name>]" 1>&2
     echo -e "\nOptions:\n"
     echo -e "    -d    Number of days to keep snapshots.  Snapshots older than this number deleted."
     echo -e "          Default if not set: 7 [OPTIONAL]"
@@ -40,6 +40,8 @@ usage() {
     echo -e "          Uses default storage location if not set [OPTIONAL]"
     echo -e "    -n    Dry run: causes script to print debug variables and doesn't execute any"
     echo -e "          create / delete commands [OPTIONAL]"
+    echo -e "    -i    Bucket name to export [OPTIONAL]"
+    echo -e "          Create image and export to Google Cloud Storage"
     echo -e "\n"
     exit 1
 }
@@ -51,7 +53,7 @@ usage() {
 
 setScriptOptions()
 {
-    while getopts ":d:rf:gcp:a:j:l:n" opt; do
+    while getopts ":d:rf:gcp:a:j:l:ni:" opt; do
         case $opt in
             d)
                 opt_d=${OPTARG}
@@ -82,6 +84,9 @@ setScriptOptions()
                 ;;
             n)
                 opt_n=true
+                ;;
+            i)
+                opt_i=${OPTARG}
                 ;;
             *)
                 usage
@@ -139,6 +144,12 @@ setScriptOptions()
     if [[ -n $opt_n ]]; then
         DRY_RUN=$opt_n
     fi
+    
+    # Create image and export
+    if [[ -n $opt_i ]]; then
+        NEED_EXPORT=true
+        OPT_EXPORT_URI="--destination-uri gs://$opt_i/"
+    fi
 
     # Copy Disk Labels to Snapshots
     if [[ -n $opt_c ]]; then
@@ -146,7 +157,7 @@ setScriptOptions()
     fi
 
     # Guest Flush (VSS for Windows)
-    if [[ -n $opt_c ]]; then
+    if [[ -n $opt_g ]]; then
         OPT_GUEST_FLUSH="--guest-flush"
     else
         OPT_GUEST_FLUSH=""
@@ -275,6 +286,27 @@ createSnapshot()
     fi
 }
 
+
+#
+# CREATES IMAGE AND RETURNS OUTPUT
+#
+# input: ${SNAPSHOT_NAME}
+#
+
+createImage()
+{
+    if [ "$NEED_EXPORT" = true ]; then
+        if [ "$DRY_RUN" = true ]; then
+            printCmd "gcloud ${OPT_ACCOUNT} compute images create $1 --source-snapshot $1 ${OPT_PROJECT}"
+            printCmd "gcloud ${OPT_ACCOUNT} compute images export ${OPT_EXPORT_URI}$1.tar.gz --image $1 --zone ${2##*/} ${OPT_PROJECT}"
+        else
+            $(gcloud $OPT_ACCOUNT --quiet compute images create $1 --source-snapshot $1 ${OPT_PROJECT} > /dev/null)
+            sleep 30
+            $(gcloud $OPT_ACCOUNT --quiet compute images export ${OPT_EXPORT_URI}$1.tar.gz --image $1 --zone ${2##*/} --timeout '10h' ${OPT_PROJECT} > /dev/null)
+        fi
+    fi
+}
+
 copyDiskLabels()
 {
   labels=$(gcloud $OPT_ACCOUNT compute disks describe $1 --zone $3 --format='value[delimiter=","](labels)' ${OPT_PROJECT})
@@ -346,6 +378,54 @@ deleteSnapshot()
     fi
 }
 
+
+#
+# DELETE SNAPSHOTS FOR DISK
+#
+# input: ${SNAPSHOT_PREFIX} ${DELETION_DATE} ${DEVICE_ID}
+#
+
+deleteImages()
+{
+    # create empty array
+    local images=()
+
+    # get list of images from gcloud for this device
+    local gcloud_response="$(gcloud $OPT_ACCOUNT compute images list --filter="name~'"$1"' AND creationTimestamp<'$2'" --uri ${OPT_PROJECT})"
+
+    # loop through and get image name from URI
+    while read line
+    do
+        # grab image name from full URI
+        image="${line##*/}"
+
+        # add image to global array
+        images+=(${image})
+
+    done <<< "$(echo -e "$gcloud_response")"
+
+    # loop through array
+    for image in "${images[@]}"; do
+        # delete image
+        deleteImage ${image}
+    done
+}
+
+
+#
+# DELETES SNAPSHOT
+#
+# input: ${SNAPSHOT_NAME}
+#
+
+deleteImage()
+{
+    if [ "$DRY_RUN" = true ]; then
+        printCmd "gcloud ${OPT_ACCOUNT} compute images delete $1 -q ${OPT_PROJECT}"
+    else
+        $(gcloud $OPT_ACCOUNT compute images delete $1 -q ${OPT_PROJECT})
+    fi
+}
 
 logTime()
 {
@@ -424,8 +504,16 @@ main()
         # delete snapshots for this disk that were created older than DELETION_DATE
         deleteSnapshots "^$PREFIX-.*" "$DELETION_DATE" "${device_id}"
 
+        # delete images for this disk that were created older than DELETION_DATE
+        deleteImages "^$PREFIX-.*" "$DELETION_DATE"
+
         # create the snapshot
         createSnapshot ${device_name} ${snapshot_name} ${device_zone}
+
+        sleep 30
+
+        # create the snapimageshot
+        createImage ${snapshot_name} ${device_zone}
 
         if [ "$COPY_LABELS" = true ]; then
             # Copy labels
@@ -435,6 +523,7 @@ main()
     done
 
     logTime "End of google-compute-snapshot"
+    rclone gcs:gameflask-backup/ dropbox:backup/
 }
 
 
